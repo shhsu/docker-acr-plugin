@@ -1,0 +1,13 @@
+{
+	"registries-login-config": {
+		"*-microsoft.azurecr.io": {
+			"module-location": "..\\login.exe",
+			"parameters": [
+				"--tenantID",
+				"xxx"
+			],
+			"redirect-outputs": false,
+			"redirect-errors": true
+		}
+	}
+}
