@@ -199,18 +199,21 @@ func getLoginOptions(serverAddress string, tenant string, refreshTokenEncoded st
 				return loginFailure, fmt.Errorf("Www-Authenticate: failed to reach auth url %s", authEndpoint)
 			} else if resp.StatusCode != 200 {
 				return loginFailure, fmt.Errorf("Www-Authenticate: auth url %s responded with status code %d", authEndpoint, resp.StatusCode)
-			} else if content, err := ioutil.ReadAll(resp.Body); err != nil {
-				return loginFailure, fmt.Errorf("Www-Authenticate: error reading response from %s", authEndpoint)
 			} else {
-				var authResp aadAuthResponse
-				if err := json.Unmarshal(content, &authResp); err != nil {
-					return loginFailure, fmt.Errorf("Www-Authenticate: unable to read response %s", content)
+				defer resp.Body.Close()
+				if content, err := ioutil.ReadAll(resp.Body); err != nil {
+					return loginFailure, fmt.Errorf("Www-Authenticate: error reading response from %s", authEndpoint)
 				} else {
-					return &loginOptions{
-						ServerAddress: serverAddress,
-						User:          "00000000-0000-0000-0000-000000000000",
-						Password:      authResp.RefreshToken,
-					}, nil
+					var authResp aadAuthResponse
+					if err := json.Unmarshal(content, &authResp); err != nil {
+						return loginFailure, fmt.Errorf("Www-Authenticate: unable to read response %s", content)
+					} else {
+						return &loginOptions{
+							ServerAddress: serverAddress,
+							User:          "00000000-0000-0000-0000-000000000000",
+							Password:      authResp.RefreshToken,
+						}, nil
+					}
 				}
 			}
 		}
