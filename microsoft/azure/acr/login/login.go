@@ -20,6 +20,7 @@ import (
 
 	"github.com/Sirupsen/logrus"
 	"github.com/cosmincojocar/adal"
+	jwt "github.com/dgrijalva/jwt-go"
 	"github.com/spf13/cobra"
 )
 
@@ -31,6 +32,10 @@ type loginOptions struct {
 
 type aadAuthResponse struct {
 	RefreshToken string `json:"refresh_token"`
+}
+
+type idTokenPayload struct {
+	TenantID string `json:"tid"`
 }
 
 var loginFailure *loginOptions
@@ -75,13 +80,13 @@ func interactiveLogin() (*adal.Token, error) {
 }
 
 func main() {
-	var tenant, registry string
+	var registry string
 	cmd := &cobra.Command{
 		Use:   "Azure Docker Registry Login Module",
 		Short: "Azure Docker Registry Login Module",
 		Long:  `A golang module that enable docker login via Azure Active Directory`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if result, err := login(tenant, registry); err != nil {
+			if result, err := login(registry); err != nil {
 				return err
 			} else if output, err := json.Marshal(result); err != nil {
 				return err
@@ -93,7 +98,6 @@ func main() {
 	}
 
 	flags := cmd.Flags()
-	flags.StringVar(&tenant, "tenantID", "", "Tenant ID, this parameter will be deprecated soon")
 	flags.StringVar(&registry, "serverAddress", "", "Registry name")
 
 	cmd.MarkFlagRequired("registry")
@@ -104,7 +108,7 @@ func main() {
 	}
 }
 
-func login(tenant string, registry string) (*loginOptions, error) {
+func login(registry string) (*loginOptions, error) {
 	if registry == "" {
 		return loginFailure, fmt.Errorf("please provide a docker registry name")
 	}
@@ -112,18 +116,25 @@ func login(tenant string, registry string) (*loginOptions, error) {
 	if adalToken, err := interactiveLogin(); err != nil {
 		return loginFailure, err
 	} else {
-		authContent := map[string]string{
-			"grant_type":    "refresh_token",
-			"refresh_token": adalToken.RefreshToken,
+		idTokenEncoded := adalToken.IDToken
+		idTokenSplit := strings.Split(idTokenEncoded, ".")
+		if len(idTokenSplit) < 2 {
+			return loginFailure, fmt.Errorf("invalid encoded id token: %s", idTokenEncoded)
 		}
-		if len(tenant) > 0 {
-			authContent["tenant"] = tenant
+		idPayloadEncoded := idTokenSplit[1]
+		if idJson, err := jwt.DecodeSegment(idPayloadEncoded); err != nil {
+			return loginFailure, fmt.Errorf("Error decoding idToken: %s", err)
+		} else {
+			var idToken idTokenPayload
+			if err := json.Unmarshal(idJson, &idToken); err != nil {
+				return loginFailure, fmt.Errorf("Error unmarshalling id token: %s", err)
+			}
+			return getLoginOptions(registry, idToken.TenantID, adalToken.RefreshToken)
 		}
-		return getLoginOptions(registry, &authContent)
 	}
 }
 
-func getLoginOptions(serverAddress string, authContent *map[string]string) (*loginOptions, error) {
+func getLoginOptions(serverAddress string, tenant string, refreshTokenEncoded string) (*loginOptions, error) {
 	challengeURL := url.URL{
 		Scheme: "https",
 		Host:   serverAddress,
@@ -171,13 +182,11 @@ func getLoginOptions(serverAddress string, authContent *map[string]string) (*log
 			return loginFailure, fmt.Errorf("Www-Authenticate: invalid realm %s", realm)
 		} else {
 			authEndpoint := fmt.Sprintf("%s://%s/oauth2/exchange", authurl.Scheme, authurl.Host)
-
 			data := url.Values{
-				"service": []string{service},
-			}
-
-			for k, v := range *authContent {
-				data[k] = []string{v}
+				"service":       []string{service},
+				"grant_type":    []string{"refresh_token"},
+				"refresh_token": []string{refreshTokenEncoded},
+				"tenant":        []string{tenant},
 			}
 
 			client := &http.Client{}
