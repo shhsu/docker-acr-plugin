@@ -57,8 +57,9 @@ func interactiveLogin() (*adal.Token, error) {
 	deviceCodeEndpoint := getOAuthBaseURL()
 	deviceCodeEndpoint.Path = path.Join(deviceCodeEndpoint.Path, "devicecode")
 
-	// Acquire the device code
-	if deviceCode, err := adal.InitiateDeviceAuth(
+	var err error
+	var deviceCode *adal.DeviceCode
+	if deviceCode, err = adal.InitiateDeviceAuth(
 		oauthClient,
 		adal.OAuthConfig{
 			AuthorizeEndpoint:  *authEndpoint,
@@ -68,15 +69,14 @@ func interactiveLogin() (*adal.Token, error) {
 		"04b07795-8ddb-461a-bbee-02f9e1bf7b46", // client id ---> copied from azure cli on python
 		"https://management.core.windows.net/"); err != nil {
 		return nil, fmt.Errorf("Failed to start device auth flow: %s", err)
-	} else {
-		fmt.Fprintf(os.Stderr, "%s\n", *deviceCode.Message)
-		// Wait here until the user is authenticated
-		if token, err := adal.WaitForUserCompletion(oauthClient, deviceCode); err != nil {
-			return nil, fmt.Errorf("Failed to finish device auth flow: %s", err)
-		} else {
-			return token, nil
-		}
 	}
+
+	fmt.Fprintf(os.Stderr, "%s\n", *deviceCode.Message)
+	var token *adal.Token
+	if token, err = adal.WaitForUserCompletion(oauthClient, deviceCode); err != nil {
+		return nil, fmt.Errorf("Failed to finish device auth flow: %s", err)
+	}
+	return token, nil
 }
 
 func main() {
@@ -113,25 +113,29 @@ func login(registry string) (*loginOptions, error) {
 		return loginFailure, fmt.Errorf("please provide a docker registry name")
 	}
 
-	if adalToken, err := interactiveLogin(); err != nil {
+	var err error
+	var adalToken *adal.Token
+	if adalToken, err = interactiveLogin(); err != nil {
 		return loginFailure, err
-	} else {
-		idTokenEncoded := adalToken.IDToken
-		idTokenSplit := strings.Split(idTokenEncoded, ".")
-		if len(idTokenSplit) < 2 {
-			return loginFailure, fmt.Errorf("invalid encoded id token: %s", idTokenEncoded)
-		}
-		idPayloadEncoded := idTokenSplit[1]
-		if idJson, err := jwt.DecodeSegment(idPayloadEncoded); err != nil {
-			return loginFailure, fmt.Errorf("Error decoding idToken: %s", err)
-		} else {
-			var idToken idTokenPayload
-			if err := json.Unmarshal(idJson, &idToken); err != nil {
-				return loginFailure, fmt.Errorf("Error unmarshalling id token: %s", err)
-			}
-			return getLoginOptions(registry, idToken.TenantID, adalToken.RefreshToken)
-		}
 	}
+
+	idTokenEncoded := adalToken.IDToken
+	idTokenSplit := strings.Split(idTokenEncoded, ".")
+	if len(idTokenSplit) < 2 {
+		return loginFailure, fmt.Errorf("invalid encoded id token: %s", idTokenEncoded)
+	}
+
+	idPayloadEncoded := idTokenSplit[1]
+	var idJSON []byte
+	if idJSON, err = jwt.DecodeSegment(idPayloadEncoded); err != nil {
+		return loginFailure, fmt.Errorf("Error decoding idToken: %s", err)
+	}
+
+	var idToken idTokenPayload
+	if err := json.Unmarshal(idJSON, &idToken); err != nil {
+		return loginFailure, fmt.Errorf("Error unmarshalling id token: %s", err)
+	}
+	return getLoginOptions(registry, idToken.TenantID, adalToken.RefreshToken)
 }
 
 func getLoginOptions(serverAddress string, tenant string, refreshTokenEncoded string) (*loginOptions, error) {
@@ -140,84 +144,100 @@ func getLoginOptions(serverAddress string, tenant string, refreshTokenEncoded st
 		Host:   serverAddress,
 		Path:   "v2/",
 	}
-	if challenge, err := http.Get(challengeURL.String()); err != nil {
+	var err error
+	var challenge *http.Response
+	if challenge, err = http.Get(challengeURL.String()); err != nil {
 		return loginFailure, fmt.Errorf("Error reaching registry endpoint %s", challengeURL.String())
-	} else if authHeader, _ := challenge.Header["Www-Authenticate"]; challenge.StatusCode != 401 || len(authHeader) != 1 {
-		return loginFailure,
-			fmt.Errorf("Registry did not issue a valid AAD challenge, status: %d, authenticate header [%s]",
-				challenge.StatusCode, strings.Join(authHeader, ", "))
-	} else {
-		tokens := strings.Split(authHeader[0], " ")
-		if len(tokens) < 2 || strings.ToLower(tokens[0]) != "bearer" {
-			return loginFailure, fmt.Errorf("Unexpected content in Www-Authenticate header: %s", authHeader[0])
+	}
+
+	defer challenge.Body.Close()
+	if challenge.StatusCode != 401 {
+		return loginFailure, fmt.Errorf("Registry did not issue a valid AAD challenge, status: %d", challenge.StatusCode)
+	}
+
+	var authHeader []string
+	var ok bool
+	if authHeader, ok = challenge.Header["Www-Authenticate"]; !ok {
+		return loginFailure, fmt.Errorf("Challenge response does not contain header 'Www-Authenticate'")
+	}
+	if len(authHeader) != 1 {
+		return loginFailure, fmt.Errorf("Registry did not issue a valid AAD challenge, authenticate header [%s]",
+			strings.Join(authHeader, ", "))
+	}
+
+	tokens := strings.Split(authHeader[0], " ")
+	if len(tokens) < 2 || strings.ToLower(tokens[0]) != "bearer" {
+		return loginFailure, fmt.Errorf("Unexpected content in Www-Authenticate header: %s", authHeader[0])
+	}
+
+	var realm, service string
+	for _, expr := range strings.Split(tokens[1], ",") {
+		declaration := strings.SplitN(expr, "=", 2)
+		if len(declaration) != 2 {
+			logrus.Errorf("Invalid Syntax in Www-Authenticate header: %s", declaration)
+			continue
 		}
-
-		var realm, service string
-		for _, expr := range strings.Split(tokens[1], ",") {
-			declaration := strings.SplitN(expr, "=", 2)
-			if len(declaration) != 2 {
-				logrus.Errorf("Invalid Syntax in Www-Authenticate header: %s", declaration)
-				continue
-			}
-			k := strings.ToLower(strings.TrimSpace(declaration[0]))
-			// might not be correct triming all quotes but we would just assume GIGO
-			v := strings.Trim(strings.TrimSpace(declaration[1]), "\"")
-
-			if k == "realm" {
-				realm = v
-			} else if k == "service" {
-				service = v
-			}
-		}
-
-		if realm == "" {
-			return loginFailure, fmt.Errorf("Www-Authenticate: realm not specified")
-		}
-
-		if service == "" {
-			return loginFailure, fmt.Errorf("Www-Authenticate: service not specified")
-		}
-
-		if authurl, err := url.Parse(realm); err != nil {
-			return loginFailure, fmt.Errorf("Www-Authenticate: invalid realm %s", realm)
-		} else {
-			authEndpoint := fmt.Sprintf("%s://%s/oauth2/exchange", authurl.Scheme, authurl.Host)
-			data := url.Values{
-				"service":       []string{service},
-				"grant_type":    []string{"refresh_token"},
-				"refresh_token": []string{refreshTokenEncoded},
-				"tenant":        []string{tenant},
-			}
-
-			client := &http.Client{}
-			datac := data.Encode()
-			r, _ := http.NewRequest("POST", authEndpoint, bytes.NewBufferString(datac))
-			r.Header.Add("Content-Type", "application/x-www-form-urlencoded")
-			r.Header.Add("Content-Length", strconv.Itoa(len(datac)))
-
-			if resp, err := client.Do(r); err != nil {
-				return loginFailure, fmt.Errorf("Www-Authenticate: failed to reach auth url %s", authEndpoint)
-			} else if resp.StatusCode != 200 {
-				return loginFailure, fmt.Errorf("Www-Authenticate: auth url %s responded with status code %d", authEndpoint, resp.StatusCode)
-			} else {
-				defer resp.Body.Close()
-				if content, err := ioutil.ReadAll(resp.Body); err != nil {
-					return loginFailure, fmt.Errorf("Www-Authenticate: error reading response from %s", authEndpoint)
-				} else {
-					var authResp aadAuthResponse
-					if err := json.Unmarshal(content, &authResp); err != nil {
-						return loginFailure, fmt.Errorf("Www-Authenticate: unable to read response %s", content)
-					} else {
-						return &loginOptions{
-							ServerAddress: serverAddress,
-							User:          "00000000-0000-0000-0000-000000000000",
-							Password:      authResp.RefreshToken,
-						}, nil
-					}
-				}
-			}
+		k := strings.ToLower(strings.TrimSpace(declaration[0]))
+		v := strings.Trim(strings.TrimSpace(declaration[1]), "\"")
+		if k == "realm" {
+			realm = v
+		} else if k == "service" {
+			service = v
 		}
 	}
+
+	if realm == "" {
+		return loginFailure, fmt.Errorf("Www-Authenticate: realm not specified")
+	}
+
+	if service == "" {
+		return loginFailure, fmt.Errorf("Www-Authenticate: service not specified")
+	}
+
+	var authURL *url.URL
+	if authURL, err = url.Parse(realm); err != nil {
+		return loginFailure, fmt.Errorf("Www-Authenticate: invalid realm %s", realm)
+	}
+
+	authEndpoint := fmt.Sprintf("%s://%s/oauth2/exchange", authURL.Scheme, authURL.Host)
+	data := url.Values{
+		"service":       []string{service},
+		"grant_type":    []string{"refresh_token"},
+		"refresh_token": []string{refreshTokenEncoded},
+		"tenant":        []string{tenant},
+	}
+
+	client := &http.Client{}
+	datac := data.Encode()
+	r, _ := http.NewRequest("POST", authEndpoint, bytes.NewBufferString(datac))
+	r.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+	r.Header.Add("Content-Length", strconv.Itoa(len(datac)))
+
+	var exchange *http.Response
+	if exchange, err = client.Do(r); err != nil {
+		return loginFailure, fmt.Errorf("Www-Authenticate: failed to reach auth url %s", authEndpoint)
+	}
+
+	defer exchange.Body.Close()
+	if exchange.StatusCode != 200 {
+		return loginFailure, fmt.Errorf("Www-Authenticate: auth url %s responded with status code %d", authEndpoint, exchange.StatusCode)
+	}
+
+	var content []byte
+	if content, err = ioutil.ReadAll(exchange.Body); err != nil {
+		return loginFailure, fmt.Errorf("Www-Authenticate: error reading response from %s", authEndpoint)
+	}
+
+	var authResp aadAuthResponse
+	if err = json.Unmarshal(content, &authResp); err != nil {
+		return loginFailure, fmt.Errorf("Www-Authenticate: unable to read response %s", content)
+	}
+
+	return &loginOptions{
+		ServerAddress: serverAddress,
+		User:          "00000000-0000-0000-0000-000000000000",
+		Password:      authResp.RefreshToken,
+	}, nil
 }
 
 func invokeCmd(cmdStr string, args []string, forwardErr bool) ([]byte, error) {
