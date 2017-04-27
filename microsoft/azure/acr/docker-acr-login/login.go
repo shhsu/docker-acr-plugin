@@ -29,7 +29,6 @@ type loginOptions struct {
 	User          string `json:"user,omitempty"`
 	Password      string `json:"password,omitempty"`
 }
-
 type aadAuthResponse struct {
 	RefreshToken string `json:"refresh_token"`
 }
@@ -38,7 +37,14 @@ type idTokenPayload struct {
 	TenantID string `json:"tid"`
 }
 
+type aadAuthArgs struct {
+	authEndpoint string
+	service      string
+	realm        string
+}
+
 var loginFailure *loginOptions
+var useInputCreds *loginOptions
 
 func getOAuthBaseURL() *url.URL {
 	return &url.URL{
@@ -80,13 +86,13 @@ func interactiveLogin() (*adal.Token, error) {
 }
 
 func main() {
-	var registry string
+	var registry, username, password string
 	cmd := &cobra.Command{
 		Use:   "Azure Docker Registry Login Module",
 		Short: "Azure Docker Registry Login Module",
 		Long:  `A golang module that enable docker login via Azure Active Directory`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if result, err := login(registry); err != nil {
+			if result, err := login(registry, username, password); err != nil {
 				return err
 			} else if output, err := json.Marshal(result); err != nil {
 				return err
@@ -99,6 +105,8 @@ func main() {
 
 	flags := cmd.Flags()
 	flags.StringVar(&registry, "serverAddress", "", "Registry name")
+	flags.StringVar(&username, "username", "", "username") // not used
+	flags.StringVar(&password, "password", "", "password") // not used
 
 	cmd.MarkFlagRequired("registry")
 
@@ -108,12 +116,30 @@ func main() {
 	}
 }
 
-func login(registry string) (*loginOptions, error) {
+func login(registry string, username string, password string) (*loginOptions, error) {
 	if registry == "" {
 		return loginFailure, fmt.Errorf("please provide a docker registry name")
 	}
 
+	// respect the username and password the user passed in
+	if username != "" || password != "" {
+		return &loginOptions{
+			User:          username,
+			Password:      password,
+			ServerAddress: registry,
+		}, nil
+	}
+
 	var err error
+	var aadArgs *aadAuthArgs
+	if aadArgs, err = getAADEntryPoint(registry); err != nil {
+		return loginFailure, err
+	} else if aadArgs == nil {
+		return &loginOptions{
+			ServerAddress: registry,
+		}, nil
+	}
+
 	var adalToken *adal.Token
 	if adalToken, err = interactiveLogin(); err != nil {
 		return loginFailure, err
@@ -135,43 +161,48 @@ func login(registry string) (*loginOptions, error) {
 	if err := json.Unmarshal(idJSON, &idToken); err != nil {
 		return loginFailure, fmt.Errorf("Error unmarshalling id token: %s", err)
 	}
-	return getLoginOptions(registry, idToken.TenantID, adalToken.RefreshToken)
+	return getLoginOptions(registry, aadArgs, idToken.TenantID, adalToken.RefreshToken)
 }
 
-func getLoginOptions(serverAddress string, tenant string, refreshTokenEncoded string) (*loginOptions, error) {
+func getAADEntryPoint(registry string) (*aadAuthArgs, error) {
 	challengeURL := url.URL{
 		Scheme: "https",
-		Host:   serverAddress,
+		Host:   registry,
 		Path:   "v2/",
 	}
 	var err error
 	var challenge *http.Response
 	if challenge, err = http.Get(challengeURL.String()); err != nil {
-		return loginFailure, fmt.Errorf("Error reaching registry endpoint %s", challengeURL.String())
+		return nil, fmt.Errorf("Error reaching registry endpoint %s", challengeURL.String())
 	}
-
 	defer challenge.Body.Close()
+
 	if challenge.StatusCode != 401 {
-		return loginFailure, fmt.Errorf("Registry did not issue a valid AAD challenge, status: %d", challenge.StatusCode)
+		return nil, fmt.Errorf("Registry did not issue a valid AAD challenge, status: %d", challenge.StatusCode)
 	}
 
 	var authHeader []string
 	var ok bool
 	if authHeader, ok = challenge.Header["Www-Authenticate"]; !ok {
-		return loginFailure, fmt.Errorf("Challenge response does not contain header 'Www-Authenticate'")
+		return nil, fmt.Errorf("Challenge response does not contain header 'Www-Authenticate'")
 	}
+
 	if len(authHeader) != 1 {
-		return loginFailure, fmt.Errorf("Registry did not issue a valid AAD challenge, authenticate header [%s]",
+		return nil, fmt.Errorf("Registry did not issue a valid AAD challenge, authenticate header [%s]",
 			strings.Join(authHeader, ", "))
 	}
 
-	tokens := strings.Split(authHeader[0], " ")
-	if len(tokens) < 2 || strings.ToLower(tokens[0]) != "bearer" {
-		return loginFailure, fmt.Errorf("Unexpected content in Www-Authenticate header: %s", authHeader[0])
+	configSections := strings.SplitN(authHeader[0], " ", 2)
+	authType := strings.ToLower(configSections[0])
+	if authType != "bearer" {
+		// unable to resolve username or password because it's not expected auth type, hand the authentication
+		// back to docker
+		return nil, nil
 	}
 
+	authParams := configSections[1]
 	var realm, service string
-	for _, expr := range strings.Split(tokens[1], ",") {
+	for _, expr := range strings.Split(authParams, ",") {
 		declaration := strings.SplitN(expr, "=", 2)
 		if len(declaration) != 2 {
 			logrus.Errorf("Invalid Syntax in Www-Authenticate header: %s", declaration)
@@ -187,21 +218,33 @@ func getLoginOptions(serverAddress string, tenant string, refreshTokenEncoded st
 	}
 
 	if realm == "" {
-		return loginFailure, fmt.Errorf("Www-Authenticate: realm not specified")
+		return nil, fmt.Errorf("Www-Authenticate: realm not specified")
 	}
 
 	if service == "" {
-		return loginFailure, fmt.Errorf("Www-Authenticate: service not specified")
+		return nil, fmt.Errorf("Www-Authenticate: service not specified")
 	}
 
 	var authURL *url.URL
 	if authURL, err = url.Parse(realm); err != nil {
-		return loginFailure, fmt.Errorf("Www-Authenticate: invalid realm %s", realm)
+		return nil, fmt.Errorf("Www-Authenticate: invalid realm %s", realm)
 	}
 
-	authEndpoint := fmt.Sprintf("%s://%s/oauth2/exchange", authURL.Scheme, authURL.Host)
+	return &aadAuthArgs{
+		realm:        realm,
+		service:      service,
+		authEndpoint: fmt.Sprintf("%s://%s/oauth2/exchange", authURL.Scheme, authURL.Host),
+	}, nil
+}
+
+func getLoginOptions(
+	serverAddress string,
+	aadArgs *aadAuthArgs,
+	tenant string,
+	refreshTokenEncoded string) (*loginOptions, error) {
+	var err error
 	data := url.Values{
-		"service":       []string{service},
+		"service":       []string{aadArgs.service},
 		"grant_type":    []string{"refresh_token"},
 		"refresh_token": []string{refreshTokenEncoded},
 		"tenant":        []string{tenant},
@@ -209,23 +252,23 @@ func getLoginOptions(serverAddress string, tenant string, refreshTokenEncoded st
 
 	client := &http.Client{}
 	datac := data.Encode()
-	r, _ := http.NewRequest("POST", authEndpoint, bytes.NewBufferString(datac))
+	r, _ := http.NewRequest("POST", aadArgs.authEndpoint, bytes.NewBufferString(datac))
 	r.Header.Add("Content-Type", "application/x-www-form-urlencoded")
 	r.Header.Add("Content-Length", strconv.Itoa(len(datac)))
 
 	var exchange *http.Response
 	if exchange, err = client.Do(r); err != nil {
-		return loginFailure, fmt.Errorf("Www-Authenticate: failed to reach auth url %s", authEndpoint)
+		return loginFailure, fmt.Errorf("Www-Authenticate: failed to reach auth url %s", aadArgs.authEndpoint)
 	}
 
 	defer exchange.Body.Close()
 	if exchange.StatusCode != 200 {
-		return loginFailure, fmt.Errorf("Www-Authenticate: auth url %s responded with status code %d", authEndpoint, exchange.StatusCode)
+		return loginFailure, fmt.Errorf("Www-Authenticate: auth url %s responded with status code %d", aadArgs.authEndpoint, exchange.StatusCode)
 	}
 
 	var content []byte
 	if content, err = ioutil.ReadAll(exchange.Body); err != nil {
-		return loginFailure, fmt.Errorf("Www-Authenticate: error reading response from %s", authEndpoint)
+		return loginFailure, fmt.Errorf("Www-Authenticate: error reading response from %s", aadArgs.authEndpoint)
 	}
 
 	var authResp aadAuthResponse
