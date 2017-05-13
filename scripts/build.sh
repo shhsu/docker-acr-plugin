@@ -69,8 +69,11 @@ docker cp ${buildContainer}:/go/src/github.com/docker-acr-plugin/docker-login-ac
 docker cp ${buildContainer}:/go/src/github.com/docker-acr-plugin/login-config-editor/login-config-editor $targetDir
 docker cp ${buildContainer}:/go/src/github.com/docker-acr-plugin/scripts/get.sh $targetDir
 
-echo "Published files in $targetDir"
+echo "The following files are published"
 ls $targetDir
+pushd $targetDir
+echo "To Directory: "`pwd`
+popd
 
 ## Note that because we are running docker build with elevated mode, we can't really remove the binaries built unless we are running as super user
 ## Therefore the script would skip cleanup to avoid error
