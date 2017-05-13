@@ -48,6 +48,8 @@ if [ ! -d $targetDir ]; then
     mkdir -p $targetDir
 fi
 
+echo "Target directory: $targetDir"
+
 Cleanup
 DeleteOutput "docker-login-acr"
 DeleteOutput "docker"
