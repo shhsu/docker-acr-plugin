@@ -22,6 +22,11 @@ import (
 	"github.com/spf13/cobra"
 )
 
+type pluginConfig struct {
+	AADServerAddress string
+	AppID            string
+}
+
 type loginOptions struct {
 	ServerAddress string `json:"server-address,omitempty"`
 	User          string `json:"username,omitempty"`
@@ -39,6 +44,11 @@ type authDirective struct {
 	Service      string `json:"service"`
 	Realm        string `json:"realm"`
 	authEndpoint string
+}
+
+type acrTokenPayload struct {
+	TenantID   string `json:"tenant"`
+	Credential string `json:"credential"`
 }
 
 func (directive *authDirective) initialize() (err error) {
@@ -62,16 +72,29 @@ func (directive *authDirective) initialize() (err error) {
 var loginFailure *loginOptions
 var useInputCreds *loginOptions
 
+// Note: This thing will be dynamic
+// prod:
+var staticConfig = pluginConfig{
+	AADServerAddress: "login.microsoftonline.com",
+	AppID:            "38f45013-0177-45e8-a12e-124b191d8f63",
+}
+
+// dogfood: copied from azure python cli
+//var staticConfig = pluginConfig{
+//	AADServerAddress: "login.windows-ppe.net",
+//	AppID:            "04b07795-8ddb-461a-bbee-02f9e1bf7b46",
+//}
+
 func getOAuthBaseURL() *url.URL {
 	return &url.URL{
 		Scheme: "https",
-		Host:   "login.microsoftonline.com",
+		Host:   staticConfig.AADServerAddress,
 		Path:   "common/oauth2",
 	}
 }
 
 func main() {
-	var serverAddress, headerObject string
+	var serverAddress, headerObject, identityToken string
 	cmd := &cobra.Command{
 		Use:   "Azure Docker Registry Login Module",
 		Short: "Azure Docker Registry Login Module",
@@ -86,7 +109,7 @@ func main() {
 				return err
 			}
 			var result *loginOptions
-			if result, err = login(serverAddress, &directive); err != nil {
+			if result, err = login(serverAddress, &directive, identityToken); err != nil {
 				return err
 			}
 
@@ -102,6 +125,7 @@ func main() {
 
 	flags := cmd.Flags()
 	flags.StringVar(&serverAddress, "serverAddress", "", "Registry login server")
+	flags.StringVar(&identityToken, "identityToken", "", "Existing identity token")
 	flags.StringVar(&headerObject, "headerObject", "", "Challenge header from the entry point")
 
 	if err := cmd.Execute(); err != nil {
@@ -110,33 +134,64 @@ func main() {
 	}
 }
 
-func login(serverAddress string, directive *authDirective) (*loginOptions, error) {
-	var err error
+func login(serverAddress string, directive *authDirective, identityToken string) (opt *loginOptions, err error) {
+	var refreshToken, tenantID string
+	if len(identityToken) == 0 {
+		tenantID, refreshToken, err = getTokensInteractively()
+	} else {
+		tenantID, refreshToken, err = performTokenRefresh(identityToken)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Unable to refresh token, please re-login...")
+			getTokensInteractively()
+		}
+	}
+	return getLoginOptions(serverAddress, directive, tenantID, refreshToken)
+}
+
+func getTokensInteractively() (tenantID string, refreshToken string, err error) {
 	var adalToken *adal.Token
-	if adalToken, err = interactiveLogin(); err != nil {
-		return loginFailure, err
+	if adalToken, err = adalDeviceLogin(); err != nil {
+		return "", "", err
 	}
 
 	accessTokenEncoded := adalToken.AccessToken
 	accessTokenSplit := strings.Split(accessTokenEncoded, ".")
 	if len(accessTokenSplit) < 2 {
-		return loginFailure, fmt.Errorf("invalid encoded id token: %s", accessTokenEncoded)
+		return "", "", fmt.Errorf("invalid encoded id token: %s", accessTokenEncoded)
 	}
 
 	idPayloadEncoded := accessTokenSplit[1]
 	var idJSON []byte
 	if idJSON, err = jwt.DecodeSegment(idPayloadEncoded); err != nil {
-		return loginFailure, fmt.Errorf("Error decoding accessToken: %s", err)
+		return "", "", fmt.Errorf("Error decoding accessToken: %s", err)
 	}
 
 	var accessToken accessTokenPayload
 	if err := json.Unmarshal(idJSON, &accessToken); err != nil {
-		return loginFailure, fmt.Errorf("Error unmarshalling id token: %s", err)
+		return "", "", fmt.Errorf("Error unmarshalling id token: %s", err)
 	}
-	return getLoginOptions(serverAddress, directive, accessToken.TenantID, adalToken.RefreshToken)
+
+	return accessToken.TenantID, adalToken.RefreshToken, nil
 }
 
-func interactiveLogin() (*adal.Token, error) {
+func performTokenRefresh(identityToken string) (tenantID string, refreshToken string, err error) {
+	tokenSegments := strings.Split(identityToken, ".")
+	if len(tokenSegments) < 2 {
+		return "", "", fmt.Errorf("Invalid existing refresh token length: %d", len(tokenSegments))
+	}
+	payloadSegmentEncoded := tokenSegments[1]
+	var payloadBytes []byte
+	if payloadBytes, err = jwt.DecodeSegment(payloadSegmentEncoded); err != nil {
+		return "", "", fmt.Errorf("Error decoding payload segment from refresh token, error: %s", err)
+	}
+	var payload acrTokenPayload
+	if err = json.Unmarshal(payloadBytes, &payload); err != nil {
+		return "", "", fmt.Errorf("Error unmarshalling acr payload, error: %s", err)
+	}
+	return payload.TenantID, payload.Credential, nil
+}
+
+func adalDeviceLogin() (*adal.Token, error) {
 	oauthClient := &http.Client{}
 	authEndpoint := getOAuthBaseURL()
 	authEndpoint.Path = path.Join(authEndpoint.Path, "authorize")
@@ -154,7 +209,7 @@ func interactiveLogin() (*adal.Token, error) {
 			TokenEndpoint:      *tokenEndpoint,
 			DeviceCodeEndpoint: *deviceCodeEndpoint,
 		},
-		"38f45013-0177-45e8-a12e-124b191d8f63",
+		staticConfig.AppID,
 		"https://management.core.windows.net/"); err != nil {
 		return nil, fmt.Errorf("Failed to start device auth flow: %s", err)
 	}
